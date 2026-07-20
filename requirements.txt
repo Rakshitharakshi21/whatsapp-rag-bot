@@ -1,0 +1,8 @@
+pdfplumber==0.10.3 
+PyPDF2==3.0.1 
+sentence-transformers==2.2.2 
+chromadb==0.4.22 
+groq==0.4.2 
+python-dotenv==1.0.0 
+numpy==1.24.3 
+pydantic==2.5.0 
