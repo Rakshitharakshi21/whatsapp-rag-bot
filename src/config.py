@@ -40,8 +40,8 @@ LLM_TEMPERATURE = 0.3
 LLM_MAX_TOKENS = 400  # Keep responses ~1200 characters for WhatsApp
 
 # Limits - UPDATED: Increased file size limit
-MAX_PDF_SIZE_MB = 25  # Changed from 10 to 25 MB
-MIN_EXTRACTED_CHARS = 100
+MAX_PDF_SIZE_MB = 10  # Changed from 10 to 25 MB
+MIN_EXTRACTED_CHARS = 25
 
 # WhatsApp Settings
 WHATSAPP_MAX_MESSAGE_LENGTH = 1200  # Characters before truncation
