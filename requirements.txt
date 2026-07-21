@@ -1,12 +1,13 @@
 pdfplumber==0.10.3
 PyPDF2==3.0.1
-sentence-transformers==2.2.2
 chromadb==0.4.22
 groq==0.4.2
 python-dotenv==1.0.0
 numpy==1.24.3
 pydantic==2.5.0
 twilio==8.10.0
-huggingface-hub==0.19.4
-transformers==4.36.2
-torch==2.1.0
+sentence-transformers==2.7.0
+huggingface-hub==0.23.4
+transformers==4.41.2
+torch==2.3.1
+tokenizers==0.19.1
