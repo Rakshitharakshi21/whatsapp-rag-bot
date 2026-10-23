@@ -37,6 +37,12 @@ def is_new_user(user_id: str) -> bool:
     return not db.user_exists(user_id)
 
 
+def register_user(user_id: str):
+    """Register newly welcomed user in the database."""
+    db.get_or_create_user(user_id)
+
+
+
 def get_welcome_message() -> str:
     """Get the welcome message for new users."""
     return WELCOME_MESSAGE

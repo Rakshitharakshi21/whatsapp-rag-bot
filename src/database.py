@@ -77,6 +77,15 @@ class Database:
             )
         """)
         
+        # Processed messages table for idempotency
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS processed_messages (
+                message_sid TEXT PRIMARY KEY,
+                user_id TEXT,
+                received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         conn.commit()
         conn.close()
         logger.info("Database initialized")
@@ -394,3 +403,32 @@ class Database:
         )
         conn.commit()
         conn.close()
+
+    def is_message_processed(self, message_sid: str) -> bool:
+        """Check if message_sid has already been processed (idempotency)."""
+        if not message_sid:
+            return False
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM processed_messages WHERE message_sid = ?", (message_sid,))
+        exists = cursor.fetchone() is not None
+        conn.close()
+        return exists
+
+    def mark_message_processed(self, message_sid: str, user_id: str) -> bool:
+        """Record message_sid in processed_messages table."""
+        if not message_sid:
+            return True
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO processed_messages (message_sid, user_id) VALUES (?, ?)",
+                (message_sid, user_id)
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except sqlite3.IntegrityError:
+            conn.close()
+            return False

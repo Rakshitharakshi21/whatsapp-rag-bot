@@ -8,7 +8,10 @@ import re
 import random
 import time
 
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Response
+import sqlite3
+import time
+
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Response, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from twilio.twiml.messaging_response import MessagingResponse
@@ -17,14 +20,20 @@ import requests
 from src.config import (
     GROQ_API_KEY, CHROMA_DB_DIR, LLM_MODEL, LLM_MODEL_QUIZ,
     TOP_K_RETRIEVAL, LLM_MAX_TOKENS, WHATSAPP_MAX_MESSAGE_LENGTH,
-    MAX_PDF_SIZE_MB
+    MAX_PDF_SIZE_MB, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN,
+    TWILIO_WHATSAPP_NUMBER, DEV_MODE
 )
+from src.database import Database
 from src.rag_pipeline import RAGPipeline
 from src.quiz_generator import QuizGenerator
 from src.session_manager import SessionManager, SessionState
-from src.welcome import WELCOME_MESSAGE, is_new_user, get_welcome_message
+from src.welcome import WELCOME_MESSAGE, is_new_user, get_welcome_message, register_user
 from src.exam_scheduler import ExamScheduler
 from src.mood_detector import detect_mood, get_encouragement_message, get_easier_quiz_prompt
+from src.structured_logger import log_stage
+from src.error_handler import safe_handler, increment_metric
+
+APP_START_TIME = time.time()
 
 # Setup logging
 logging.basicConfig(
@@ -41,10 +50,23 @@ app = FastAPI(
 )
 
 # Initialize components
+db = Database()
 pipeline = RAGPipeline(str(CHROMA_DB_DIR), GROQ_API_KEY)
 quiz_gen = QuizGenerator()
 session_mgr = SessionManager()
 exam_scheduler = ExamScheduler()
+
+class MessageCollector:
+    """Helper to collect message bodies during message processing."""
+    def __init__(self):
+        self._parts = []
+
+    def body(self, text: str):
+        if text:
+            self._parts.append(text)
+
+    def get_text(self) -> str:
+        return "\n\n".join(self._parts)
 
 # Pydantic models for request/response
 class AskRequest(BaseModel):
@@ -381,53 +403,188 @@ async def root():
     }
 
 
+def extract_body_from_twiml(twiml_xml: str) -> str:
+    """Extract plain text from Twilio MessagingResponse XML."""
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(twiml_xml)
+        bodies = [elem.text for elem in root.findall(".//Body") if elem.text]
+        meaningful = [b for b in bodies if not ("Please wait." in b or "Let me think..." in b)]
+        if meaningful:
+            return "\n\n".join(meaningful)
+        return "\n\n".join(bodies)
+    except Exception as e:
+        logger.warning(f"Error parsing TwiML XML: {e}")
+        return ""
+
+
+def send_whatsapp_message(to_user_id: str, body: str) -> bool:
+    """Send an outbound WhatsApp message via Twilio REST API."""
+    if not body:
+        return False
+    if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+        logger.warning(f"[MOCK/LOCAL TWILIO] Would send to {to_user_id}: {body[:80]}...")
+        return False
+    try:
+        from twilio.rest import Client as TwilioClient
+        client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        recipient = to_user_id if to_user_id.startswith("whatsapp:") else f"whatsapp:{to_user_id}"
+        client.messages.create(
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=recipient,
+            body=truncate_message(body)
+        )
+        logger.info(f"Outbound WhatsApp message sent to {to_user_id}")
+        return True
+    except Exception as e:
+        logger.exception(f"Failed to send outbound WhatsApp message to {to_user_id}: {e}")
+        increment_metric("twilio_send_error")
+        return False
+
+
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "chunks_stored": pipeline.vector_store.collection.count()}
+    """Health check endpoint validating database, vector store, Groq and Twilio."""
+    db_ok = False
+    try:
+        db.user_exists("health_probe")
+        db_ok = True
+    except Exception as e:
+        logger.warning(f"DB health check failed: {e}")
+
+    chroma_ok = False
+    chunks_count = 0
+    try:
+        chunks_count = pipeline.vector_store.collection.count()
+        chroma_ok = True
+    except Exception as e:
+        logger.warning(f"Chroma health check failed: {e}")
+
+    return {
+        "status": "healthy" if (db_ok and chroma_ok) else "degraded",
+        "db": db_ok,
+        "chroma": chroma_ok,
+        "chunks_stored": chunks_count,
+        "groq_reachable": bool(GROQ_API_KEY),
+        "twilio_configured": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_WHATSAPP_NUMBER),
+        "uptime": round(time.time() - APP_START_TIME, 1)
+    }
 
 
-@app.post("/upload", response_model=UploadResponse)
-async def upload_pdf(
-    file: UploadFile = File(...),
-    user_id: str = Form(...)
-):
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
-    content = await file.read()
-    result = pipeline.process_pdf(content, user_id, file.filename)
-    if result['success']:
-        return UploadResponse(
-            success=True,
-            message="PDF processed successfully",
-            chunks_added=result['chunks_added'],
-            total_chars=result['total_chars'],
-            filename=result['filename']
-        )
-    else:
-        raise HTTPException(status_code=400, detail=result['error'])
+@app.get("/diagnostics")
+async def diagnostics():
+    """Detailed system diagnostic status."""
+    chroma_count = -1
+    try:
+        chroma_count = pipeline.vector_store.collection.count()
+    except Exception:
+        pass
 
+    row_counts = {}
+    try:
+        conn = sqlite3.connect(db.db_path)
+        cursor = conn.cursor()
+        for tbl in ["users", "pdf_metadata", "quiz_results", "exam_schedules", "processed_messages"]:
+            cursor.execute(f"SELECT COUNT(*) FROM {tbl}")
+            row_counts[tbl] = cursor.fetchone()[0]
+        conn.close()
+    except Exception as e:
+        row_counts["error"] = str(e)
 
-@app.post("/ask", response_model=AskResponse)
-async def ask_question(request: AskRequest):
-    result = pipeline.ask_question(request.query, request.user_id)
-    return AskResponse(
-        success=result['success'],
-        answer=result['answer'],
-        sources=result.get('sources', []),
-        num_sources=result.get('num_sources', 0)
-    )
+    groq_status = "unavailable"
+    models = []
+    try:
+        from groq import Groq
+        if GROQ_API_KEY:
+            client = Groq(api_key=GROQ_API_KEY)
+            models_resp = client.models.list()
+            models = [m.id for m in models_resp.data][:5]
+            groq_status = "ok"
+    except Exception as e:
+        groq_status = f"error: {str(e)}"
+
+    return {
+        "status": "ok",
+        "groq": {"status": groq_status, "sample_models": models},
+        "chroma": {"collection_count": chroma_count},
+        "database": {"row_counts": row_counts},
+        "uptime": round(time.time() - APP_START_TIME, 1)
+    }
 
 
 @app.get("/webhook")
 async def webhook_get():
-    return {"message": "Webhook is active. Use POST for messages."}
+    """Webhook URL verification endpoint."""
+    return {"ok": True, "message": "Webhook is active. Use POST for messages."}
+
+
+@app.post("/webhook/test")
+async def webhook_test(body: dict):
+    """Dev-only simulation endpoint."""
+    if not DEV_MODE:
+        raise HTTPException(status_code=403, detail="Test webhook is only available when DEV_MODE=1")
+    user_id = body.get("user_id", "test_user")
+    message = body.get("message", "Hello")
+    form_data = {
+        "From": f"whatsapp:{user_id}",
+        "Body": message,
+        "MessageSid": f"test_{int(time.time()*1000)}"
+    }
+    twiml_resp = await handle_incoming_message_core(form_data)
+    content_str = twiml_resp.body.decode("utf-8") if hasattr(twiml_resp, "body") else str(twiml_resp)
+    reply_text = extract_body_from_twiml(content_str)
+    return {"user_id": user_id, "incoming": message, "reply": reply_text}
 
 
 @app.post("/webhook")
-async def webhook(request: Request):
-    """Handle incoming WhatsApp messages with all features integrated."""
+async def webhook(request: Request, bg: BackgroundTasks):
+    """Handle incoming WhatsApp messages with asynchronous background execution."""
+    form = await request.form()
+    form_data = dict(form)
+    raw_from = form_data.get('From', '')
+    user_id = raw_from.replace('whatsapp:', '').strip()
+    message_sid = form_data.get('MessageSid', '')
+
+    log_stage(user_id=user_id, stage="webhook_received", message_id=message_sid)
+
+    # Idempotency check: duplicate MessageSid protection
+    if message_sid and db.is_message_processed(message_sid):
+        logger.info(f"Duplicate MessageSid {message_sid} ignored.")
+        log_stage(user_id=user_id, stage="duplicate_ignored", message_id=message_sid)
+        return Response("<Response/>", media_type="application/xml")
+
+    if message_sid:
+        db.mark_message_processed(message_sid, user_id)
+
+    bg.add_task(process_message_background, form_data)
+    return Response("<Response/>", media_type="application/xml")
+
+
+async def process_message_background(form_data: dict):
+    """Background task to execute pipeline and dispatch outbound message via Twilio REST."""
+    start_t = time.time()
+    user_id = form_data.get('From', '').replace('whatsapp:', '').strip()
+    message_sid = form_data.get('MessageSid', '')
     try:
-        form = await request.form()
+        twiml_resp = await handle_incoming_message_core(form_data)
+        content_str = twiml_resp.body.decode("utf-8") if hasattr(twiml_resp, "body") else str(twiml_resp)
+        reply_text = extract_body_from_twiml(content_str)
+        if reply_text:
+            send_whatsapp_message(user_id, reply_text)
+            latency = (time.time() - start_t) * 1000
+            log_stage(user_id=user_id, stage="reply_sent", message_id=message_sid, latency_ms=latency, outcome="success")
+    except Exception as e:
+        logger.exception(f"Error in background processing for {user_id}: {e}")
+        increment_metric("webhook_error")
+        send_whatsapp_message(user_id, "❌ Sorry, something went wrong. Please try again.")
+        latency = (time.time() - start_t) * 1000
+        log_stage(user_id=user_id, stage="error", message_id=message_sid, latency_ms=latency, outcome="failure", extra={"error": str(e)})
+
+
+@safe_handler(fallback_message="❌ Sorry, something went wrong. Please try again.")
+async def handle_incoming_message_core(form: dict) -> Response:
+    """Internal core handler for WhatsApp messages."""
+    try:
         raw_from = form.get('From', '')
         user_id = raw_from.replace('whatsapp:', '').strip()
         incoming_msg = form.get('Body', '').strip()
@@ -443,7 +600,16 @@ async def webhook(request: Request):
         # ========== FIRST-TIME USER CHECK ==========
         if is_new_user(user_id):
             logger.info(f"New user detected: {user_id}")
+            register_user(user_id)
             msg.body(WELCOME_MESSAGE)
+            return Response(content=str(resp), media_type="application/xml")
+
+        # ========== GREETING / HELLO CHECK ==========
+        if incoming_msg.lower() in ["hi", "hello", "hey", "start"]:
+            if not session_mgr.has_pdf(user_id):
+                msg.body("👋 Hello! Welcome to your Study Assistant Bot.\n\n📚 Send me a PDF file to begin extracting notes, generating summaries, and taking quizzes!")
+            else:
+                msg.body(f"👋 Hello! Welcome back.\n\n{get_menu_text()}")
             return Response(content=str(resp), media_type="application/xml")
         
         logger.info(f"Received message from user: {user_id}")
